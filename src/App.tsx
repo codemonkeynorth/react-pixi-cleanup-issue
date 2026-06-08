@@ -1,14 +1,31 @@
-import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from "react"
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type ReactNode,
+} from "react"
 import { Application } from "@pixi/react"
-import { Texture } from "pixi.js"
+import { Texture, type Renderer } from "pixi.js"
 
 import {
-  estimateTextureBytes,
-  loadImageTexture,
-  releaseTexture,
+  BATCH_POOL_TEST_MODES,
+  runsBatchSweepOnRelease,
+  type BatchPoolTestMode,
+} from "./batchPoolTestMode"
+import { clearStaleBatchTextureRefs } from "./clearStaleBatchTextureRefs"
+import {
+  LEAK_SCENE_SPRITE_COUNT,
+  LEAK_SCENE_STAGE_COUNT,
+} from "./leakSceneConfig"
+import {
+  loadSceneTextures,
+  releaseTextures,
   scheduleReleaseTexture,
-  type TextureCleanupMode,
 } from "./loadImageTexture"
+import { PixiLeakScene } from "./PixiLeakScene"
+import { schedulePixiTextureGc } from "./runPixiTextureGc"
 
 import "./pixiSetup"
 
@@ -17,14 +34,6 @@ const IMAGE_URLS = [
   "/images/sample-2.png",
   "/images/sample-3.png",
 ] as const
-
-const CLEANUP_MODES: { value: TextureCleanupMode; label: string }[] = [
-  { value: "none", label: "No cleanup (memory leak repro)" },
-  { value: "immediate", label: "Immediate cleanup (addressModeU bug repro)" },
-  { value: "deferred", label: "Deferred cleanup (app workaround)" },
-]
-
-type CalloutTone = "issue" | "ok"
 
 const codeStyle: CSSProperties = {
   fontFamily: "ui-monospace, monospace",
@@ -35,49 +44,33 @@ const Code = ({ children }: { children: ReactNode }) => (
   <code style={codeStyle}>{children}</code>
 )
 
-type Callout = { tone: CalloutTone; title: string; body: ReactNode }
-
-const CLEANUP_CALLOUTS: Record<TextureCleanupMode, Callout> = {
-  none: {
+const CALLOUTS: Record<
+  BatchPoolTestMode,
+  { tone: "issue" | "ok"; title: string; body: ReactNode }
+> = {
+  releaseAfterRebind: {
     tone: "issue",
-    title: "Issue 1 — memory retention",
+    title: "Batch-pool shell retention",
     body: (
       <>
-        Old textures are never destroyed. Click Next repeatedly and watch tracked RGBA and JS heap
-        climb in DevTools — retained <Code>BufferImageSource</Code>, <Code>Texture</Code>, and
-        batch-pool buffers should grow until Pixi reclaims them without app-side sweeps.
+        {LEAK_SCENE_STAGE_COUNT} filtered stages, each with its own{" "}
+        <Code>BufferImageSource</Code>. On Next: rebind sprites, then{" "}
+        <Code>unload()</Code> → zero <Code>resource</Code> → <Code>destroy(true)</Code>. Stale heap
+        instances should be ~0.5 KB with empty <Code>resource</Code> — not full image buffers.
       </>
     ),
   },
-  immediate: {
-    tone: "issue",
-    title: "Issue 2 — addressModeU crash",
-    body: (
-      <>
-        Destroys the previous texture before the sprite rebinds. With an image already loaded, click
-        Next once — expect <Code>applyStyleParams: addressModeU</Code> until Pixi handles destroyed
-        bound textures gracefully (skip draw or safe fallback, not throw).
-      </>
-    ),
-  },
-  deferred: {
+  releaseWithBatchSweep: {
     tone: "ok",
-    title: "Workaround — issues resolved in-app",
+    title: "Control — batch sweep after release",
     body: (
       <>
-        Releases the previous texture after a few frames once the sprite has rebound:{" "}
-        <Code>source.unload()</Code> → zero typed-array resource → <Code>texture.destroy(true)</Code>.
-        Repeated Next clicks should not crash and tracked memory should stay flat. This is what the
-        production scanner does until Pixi fixes retention and immediate-destroy safety.
+        Same release path, plus <Code>batch.textures.clear()</Code> on{" "}
+        <Code>_batchersByInstructionSet</Code>. <Code># Delta</Code> should flatten vs release-only
+        if Pixi retains destroyed shells in the batch pipe.
       </>
     ),
   },
-}
-
-type MemorySnapshot = {
-  heapUsedMB: number | null
-  trackedTextures: number
-  trackedBytesMB: number
 }
 
 function readHeapUsedMB(): number | null {
@@ -86,77 +79,57 @@ function readHeapUsedMB(): number | null {
   return memory.usedJSHeapSize / 1024 / 1024
 }
 
-function dropFromTracked(created: Texture[], texture: Texture): Texture[] {
-  return created.filter((t) => t !== texture)
-}
-
 export default function App() {
   const [imageIndex, setImageIndex] = useState(0)
-  const [texture, setTexture] = useState<Texture | null>(null)
+  const [sceneTextures, setSceneTextures] = useState<Texture[]>([])
   const [loading, setLoading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const [cleanupMode, setCleanupMode] = useState<TextureCleanupMode>("none")
+  const [testMode, setTestMode] = useState<BatchPoolTestMode>("releaseAfterRebind")
   const [navCount, setNavCount] = useState(0)
-  const [memory, setMemory] = useState<MemorySnapshot>({
-    heapUsedMB: readHeapUsedMB(),
-    trackedTextures: 0,
-    trackedBytesMB: 0,
-  })
+  const [heldTextures, setHeldTextures] = useState(0)
+  const [heapUsedMB, setHeapUsedMB] = useState<number | null>(readHeapUsedMB())
 
   const viewportRef = useRef<HTMLDivElement | null>(null)
-  const textureRef = useRef<Texture | null>(null)
-  const createdTexturesRef = useRef<Texture[]>([])
-  const cleanupModeRef = useRef(cleanupMode)
-  cleanupModeRef.current = cleanupMode
+  const texturesRef = useRef<Texture[]>([])
+  const pendingReleaseRef = useRef<Texture[]>([])
+  const rendererRef = useRef<Renderer | null>(null)
+  const testModeRef = useRef(testMode)
+  testModeRef.current = testMode
 
   const currentUrl = IMAGE_URLS[imageIndex % IMAGE_URLS.length]
 
-  const releasePreviousTexture = (previous: Texture, mode: TextureCleanupMode) => {
-    if (mode === "none") return
+  const onRenderer = useCallback((renderer: Renderer) => {
+    rendererRef.current = renderer
+  }, [])
 
-    createdTexturesRef.current = dropFromTracked(createdTexturesRef.current, previous)
-
-    if (mode === "immediate") {
-      releaseTexture(previous)
-      return
+  const finishRelease = useCallback((previous: Texture[], mode: BatchPoolTestMode) => {
+    releaseTextures(previous)
+    if (runsBatchSweepOnRelease(mode)) {
+      clearStaleBatchTextureRefs(rendererRef.current)
     }
-
-    scheduleReleaseTexture(previous)
-  }
+    schedulePixiTextureGc(rendererRef.current)
+  }, [])
 
   useEffect(() => {
     let cancelled = false
 
     const load = async () => {
       setLoading(true)
-      setError(null)
 
       try {
-        const nextTexture = await loadImageTexture(currentUrl)
+        const previous = [...texturesRef.current]
+        const nextTextures = await loadSceneTextures(currentUrl, LEAK_SCENE_SPRITE_COUNT)
         if (cancelled) {
-          releaseTexture(nextTexture)
+          releaseTextures(nextTextures)
           return
         }
 
-        const previous = textureRef.current
-        const mode = cleanupModeRef.current
+        texturesRef.current = nextTextures
+        setSceneTextures(nextTextures)
 
-        if (previous && mode === "immediate") {
-          releasePreviousTexture(previous, "immediate")
+        if (previous.length > 0) {
+          pendingReleaseRef.current = previous
         }
-
-        textureRef.current = nextTexture
-        createdTexturesRef.current.push(nextTexture)
-        setTexture(nextTexture)
-
-        if (previous && mode === "deferred") {
-          releasePreviousTexture(previous, "deferred")
-        }
-      } catch (err) {
-        if (!cancelled) {
-          setError(err instanceof Error ? err.message : String(err))
-        }
-      } finally {
+      } catch {
         if (!cancelled) setLoading(false)
       }
     }
@@ -168,94 +141,97 @@ export default function App() {
     }
   }, [currentUrl])
 
+  const onSceneReady = useCallback(() => {
+    const pending = pendingReleaseRef.current
+    if (pending.length > 0) {
+      pendingReleaseRef.current = []
+      finishRelease(pending, testModeRef.current)
+    }
+    setLoading(false)
+  }, [finishRelease])
+
   useEffect(() => {
     const id = window.setInterval(() => {
-      const live = createdTexturesRef.current.filter((t) => !t.destroyed)
-      createdTexturesRef.current = live
-      const trackedBytes = live.reduce((sum, t) => sum + estimateTextureBytes(t), 0)
-      setMemory({
-        heapUsedMB: readHeapUsedMB(),
-        trackedTextures: live.length,
-        trackedBytesMB: trackedBytes / 1024 / 1024,
-      })
+      setHeldTextures(
+        texturesRef.current.filter((t) => t && !t.destroyed && t !== Texture.EMPTY).length,
+      )
+      setHeapUsedMB(readHeapUsedMB())
     }, 500)
-
     return () => window.clearInterval(id)
   }, [])
 
   useEffect(() => {
     return () => {
-      const pending = [...createdTexturesRef.current]
-      createdTexturesRef.current = []
-      textureRef.current = null
-      for (const t of pending) {
-        scheduleReleaseTexture(t)
+      const pending = [...texturesRef.current]
+      texturesRef.current = []
+      for (const texture of pending) {
+        scheduleReleaseTexture(texture)
       }
     }
   }, [])
 
-  const onNext = () => {
-    setImageIndex((i) => (i + 1) % IMAGE_URLS.length)
-    setNavCount((c) => c + 1)
-  }
-
-  const cleanupCallout = CLEANUP_CALLOUTS[cleanupMode]
-  const calloutStyle = cleanupCallout.tone === "ok" ? styles.calloutOk : styles.calloutIssue
+  const callout = CALLOUTS[testMode]
 
   return (
     <div style={styles.page}>
       <header style={styles.header}>
-        <h1 style={styles.title}>Pixi texture lifecycle repro</h1>
+        <h1 style={styles.title}>Pixi batch-pool shell retention</h1>
         <p style={styles.subtitle}>
-          image-js decode → BufferImageSource → Texture → @pixi/react sprite. Two issues: retained
-          memory on texture swap, and crash when destroying a texture the sprite still references.
+          Dynamic <Code>BufferImageSource</Code> textures, correct destroy after sprite rebind.
+          Compare <Code>BufferImageSource # Delta</Code> in Chrome heap snapshots.
         </p>
       </header>
 
       <div style={styles.controls}>
-        <button type="button" onClick={onNext} disabled={loading}>
+        <button
+          type="button"
+          onClick={() => {
+            setImageIndex((i) => (i + 1) % IMAGE_URLS.length)
+            setNavCount((c) => c + 1)
+          }}
+          disabled={loading}
+        >
           Next image
         </button>
+        <span style={styles.muted}>Navigations: {navCount}</span>
       </div>
 
       <fieldset style={styles.fieldset}>
-        <legend style={styles.legend}>Texture cleanup on Next</legend>
-        {CLEANUP_MODES.map(({ value, label }) => (
+        <legend style={styles.legend}>Method</legend>
+        {BATCH_POOL_TEST_MODES.map(({ value, label }) => (
           <label key={value} style={styles.radio}>
             <input
               type="radio"
-              name="cleanupMode"
+              name="batchPoolTestMode"
               value={value}
-              checked={cleanupMode === value}
-              onChange={() => setCleanupMode(value)}
+              checked={testMode === value}
+              onChange={() => setTestMode(value)}
             />
             {label}
           </label>
         ))}
       </fieldset>
 
-      <div style={calloutStyle}>
-        <strong>{cleanupCallout.title}</strong>
-        <p style={styles.calloutBody}>{cleanupCallout.body}</p>
+      <div style={callout.tone === "ok" ? styles.calloutOk : styles.calloutIssue}>
+        <strong>{callout.title}</strong>
+        <p style={styles.calloutBody}>{callout.body}</p>
       </div>
 
       <div style={styles.stats}>
         <span>Image: {currentUrl}</span>
-        <span>Navigations: {navCount}</span>
-        <span>Cleanup: {cleanupMode}</span>
-        <span>Loading: {loading ? "yes" : "no"}</span>
-        <span>Tracked textures: {memory.trackedTextures}</span>
-        <span>Tracked RGBA: {memory.trackedBytesMB.toFixed(2)} MB</span>
+        <span>App-held textures: {heldTextures}</span>
         <span>
-          JS heap: {memory.heapUsedMB == null ? "n/a (Chrome only)" : `${memory.heapUsedMB.toFixed(1)} MB`}
+          JS heap: {heapUsedMB == null ? "n/a (Chrome only)" : `${heapUsedMB.toFixed(1)} MB`}
         </span>
       </div>
 
-      {error ? <p style={styles.error}>{error}</p> : null}
-
       <div ref={viewportRef} style={styles.viewport}>
         <Application background="#111" resizeTo={viewportRef} antialias={false}>
-          <pixiSprite texture={texture ?? Texture.EMPTY} x={0} y={0} />
+          <PixiLeakScene
+            textures={sceneTextures}
+            onRenderer={onRenderer}
+            onSceneReady={onSceneReady}
+          />
         </Application>
       </div>
     </div>
@@ -274,14 +250,20 @@ const styles: Record<string, CSSProperties> = {
   },
   header: { marginBottom: "0.75rem" },
   title: { margin: "0 0 0.25rem", fontSize: "1.25rem" },
-  subtitle: { margin: 0, opacity: 0.75, maxWidth: "52rem" },
-  controls: { display: "flex", gap: "1rem", alignItems: "center", marginBottom: "0.5rem" },
+  subtitle: { margin: 0, opacity: 0.75, maxWidth: "52rem", lineHeight: 1.45 },
+  controls: {
+    display: "flex",
+    gap: "1rem",
+    alignItems: "center",
+    marginBottom: "0.5rem",
+  },
+  muted: { fontSize: "0.875rem", opacity: 0.7 },
   fieldset: {
     border: "1px solid #333",
     borderRadius: "4px",
     margin: "0 0 0.75rem",
     padding: "0.5rem 0.75rem",
-    maxWidth: "36rem",
+    maxWidth: "48rem",
   },
   legend: { padding: "0 0.25rem", fontSize: "0.875rem" },
   radio: {
@@ -321,7 +303,6 @@ const styles: Record<string, CSSProperties> = {
     opacity: 0.9,
     marginBottom: "0.75rem",
   },
-  error: { color: "#f87171" },
   viewport: {
     width: "100%",
     height: "min(70vh, 720px)",

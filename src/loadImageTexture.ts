@@ -65,10 +65,40 @@ export async function loadImageTexture(url: string): Promise<Texture> {
   return createTextureFromRgba(rgba, width, height)
 }
 
-/** How to release the previous texture when navigating to the next image. */
-export type TextureCleanupMode = "none" | "deferred" | "immediate"
+/** One BufferImageSource per filtered sprite in the leak scene. */
+export async function loadSceneTextures(url: string, count: number): Promise<Texture[]> {
+  const textures: Texture[] = []
+  for (let i = 0; i < count; i += 1) {
+    textures.push(await loadImageTexture(url))
+  }
+  return textures
+}
 
-/** Minimal manual release — not enabled by default in the repro. */
+export function releaseTextures(textures: Iterable<Texture | null | undefined>): void {
+  for (const texture of textures) {
+    releaseTexture(texture)
+  }
+}
+
+export function waitFrames(frames = 2): Promise<void> {
+  return new Promise((resolve) => {
+    let remaining = Math.max(1, frames)
+    const tick = () => {
+      remaining -= 1
+      if (remaining > 0) {
+        requestAnimationFrame(tick)
+        return
+      }
+      resolve()
+    }
+    requestAnimationFrame(tick)
+  })
+}
+
+/**
+ * Production-equivalent release: unload GPU → zero CPU `resource` → `destroy(true)`.
+ * Retained Pixi batch-pool shells should be ~0.5 KB with `resource` empty — not full image buffers.
+ */
 export function releaseTexture(texture: Texture | null | undefined): void {
   if (!texture || texture.destroyed) return
 
@@ -99,10 +129,7 @@ export function releaseTexture(texture: Texture | null | undefined): void {
   texture.destroy(true)
 }
 
-/**
- * Defer destroy until @pixi/react has rebound the sprite (immediate destroy while the
- * sprite still references the texture crashes Pixi: addressModeU on null).
- */
+/** Defer destroy until sprites have rebound to new textures. */
 export function scheduleReleaseTexture(
   texture: Texture | null | undefined,
   frames = 3,
@@ -119,14 +146,4 @@ export function scheduleReleaseTexture(
     releaseTexture(texture)
   }
   requestAnimationFrame(tick)
-}
-
-export function estimateTextureBytes(texture: Texture | null | undefined): number {
-  if (!texture || texture.destroyed) return 0
-  const resource = texture.source?.resource
-  if (resource instanceof Uint8Array || resource instanceof Uint8ClampedArray) {
-    return resource.byteLength
-  }
-  const { width, height } = texture
-  return width > 0 && height > 0 ? width * height * 4 : 0
 }
