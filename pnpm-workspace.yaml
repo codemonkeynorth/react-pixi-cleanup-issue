@@ -1,4 +1,0 @@
-# pnpm 11: explicit allow/deny for dependency install scripts (strictDepBuilds).
-allowBuilds:
-  # Transitive optional peer of image-js; sample generation uses Image/encodePng only.
-  skia-canvas: false

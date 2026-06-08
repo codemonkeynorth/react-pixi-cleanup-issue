@@ -4,7 +4,6 @@
   "version": "0.0.1",
   "type": "module",
   "scripts": {
-    "preinstall": "node scripts/enforce-pnpm.mjs",
     "generate-samples": "node scripts/generate-samples.mjs",
     "dev": "node scripts/generate-samples.mjs && vite",
     "build": "tsc -b && vite build",
@@ -26,6 +25,5 @@
     "babel-plugin-react-compiler": "1.0.0",
     "typescript": "~6.0.3",
     "vite": "^8.0.14"
-  },
-  "packageManager": "pnpm@11.5.0"
+  }
 }

@@ -1,50 +1,56 @@
-# Pixi texture lifecycle repro
+# react-pixi-cleanup-issue
 
 Minimal standalone repro for PixiJS developers: **image-js decode → `BufferImageSource` → `Texture` → `@pixi/react` sprite**, then navigate to the next image.
 
-No simulator framework — two separate issues are exercised via the **Texture cleanup on Next** radio group.
+Repo: [codemonkeynorth/react-pixi-cleanup-issue](https://github.com/codemonkeynorth/react-pixi-cleanup-issue)
+
+No simulator framework — two separate issues are exercised via the **Texture cleanup on Next** radio group. Full issue text for filing on GitHub: [`docs/issues/`](docs/issues/).
 
 ## Stack
 
 - pixi.js ^8.18
-- @pixi/react ^8.0
+- @pixi/react ^8.0.5
 - React 19 + React Compiler (babel-plugin-react-compiler)
 - image-js ^1.6 (8-bit PNG decode today; same path extends to 16-bit)
 
 ## Run
 
 ```bash
-pnpm install
-pnpm dev
+npm install
+npm run dev
 ```
 
-## Issue 1 — memory retention
+`npm run dev` regenerates sample PNGs then starts Vite.
+
+## Issue 1 — Memory retention
+
+Old textures are never destroyed. JS heap and tracked RGBA grow on every **Next image** click until Pixi reclaims replaced dynamic textures without app-side workarounds.
+
+**Steps to reproduce**
 
 1. Select **No cleanup (memory leak repro)**.
-2. Open Chrome DevTools → Memory, take a snapshot.
-3. Click **Next image** 20–50 times (cycles 512×384, 768×512, 1024×768 PNGs).
-4. Take another snapshot — look for retained `BufferImageSource`, `Texture`, batch pool / `ViewableBuffer` growth.
-
-**Expected fix from Pixi:** GC / batch pool should release CPU/GPU resources when textures are no longer referenced, without app-side batch sweeps.
+2. Wait for the first image to load.
+3. Open Chrome DevTools → Memory, take a heap snapshot.
+4. Click **Next image** 20–50 times (cycles 512×384, 768×512, 1024×768 PNGs).
+5. Take another heap snapshot — look for retained `BufferImageSource`, `Texture`, and typed-array / batch-pool growth.
+6. For comparison, repeat with **Deferred cleanup (app workaround)** — tracked RGBA and heap should stay flat.
 
 ## Issue 2 — `addressModeU` crash on immediate destroy
+
+Destroying the previous texture before the sprite rebinds crashes the renderer on the first swap.
+
+**Steps to reproduce**
 
 1. Wait for the first image to load.
 2. Select **Immediate cleanup (addressModeU bug repro)**.
 3. Click **Next image** once.
 
-**Current behaviour:** console throws `applyStyleParams.mjs: Cannot read properties of null (reading 'addressModeU')` because the previous texture is destroyed while the `@pixi/react` sprite still references it for at least one render.
-
-**Expected fix from Pixi:** destroying or invalidating a bound texture should not crash the renderer — skip the draw, bind a safe fallback, or tolerate `Texture.EMPTY`-style semantics without throwing.
+Expect `applyStyleParams: Cannot read properties of null (reading 'addressModeU')` until Pixi handles destroyed bound textures gracefully.
 
 ## Workaround (app-side)
 
-Select **Deferred cleanup (app workaround)** — releases via `source.unload()`, zeroes the typed-array resource, then `texture.destroy(true)` after a few animation frames once the sprite has rebound. This is what the production scanner app does in `pixiTextureLifecycle.ts`.
+Select **Deferred cleanup (app workaround)** — assign the new texture first, then release the previous one after a few animation frames (`source.unload()`, zero typed-array resource, `texture.destroy(true)`). See `src/loadImageTexture.ts`.
 
 ## Sample images
 
-`pnpm generate-samples` writes three synthetic PNGs to `public/images/`. Replace them with your own 8-bit (or later 16-bit) scan PNGs if needed.
-
-## Related production workaround
-
-The full scanner app implements manual release in `pixiTextureLifecycle.ts` (batch-pool sweep, deferred destroy, GC tuning). This repo keeps those paths explicit and selectable so Pixi can fix the root causes.
+`npm run generate-samples` writes three synthetic PNGs to `public/images/`. Replace them with your own 8-bit (or later 16-bit) scan PNGs if needed.
