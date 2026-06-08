@@ -1,31 +1,9 @@
 import { defineConfig } from "vite"
-import react, { reactCompilerPreset } from "@vitejs/plugin-react"
-import babel from "@rolldown/plugin-babel"
-
-const babelInclude = [/[/\\]src[/\\].*\.[cm]?[jt]sx?$/]
-const babelExclude = [/[/\\]node_modules[/\\]/]
+import react from "@vitejs/plugin-react"
 
 export default defineConfig({
-  plugins: [
-    react({
-      include: babelInclude,
-      exclude: babelExclude,
-    }),
-    babel({
-      include: babelInclude,
-      exclude: babelExclude,
-      presets: [reactCompilerPreset({ target: "19" })],
-    }),
-  ],
+  plugins: [react()],
   optimizeDeps: {
-    include: [
-      "react",
-      "react-dom",
-      "react/jsx-runtime",
-      "react/compiler-runtime",
-      "pixi.js",
-      "@pixi/react",
-      "image-js",
-    ],
+    include: ["pixi.js", "@pixi/react", "image-js"],
   },
 })

@@ -10,7 +10,7 @@ No simulator framework — two separate issues are exercised via the **Texture c
 
 - pixi.js ^8.18
 - @pixi/react ^8.0.5
-- React 19 + React Compiler (babel-plugin-react-compiler)
+- React 19 + Vite 6 (StackBlitz-compatible — no Rolldown / React Compiler)
 - image-js ^1.6 (8-bit PNG decode today; same path extends to 16-bit)
 
 ## Run
@@ -20,7 +20,9 @@ npm install
 npm run dev
 ```
 
-`npm run dev` regenerates sample PNGs then starts Vite.
+Sample PNGs are committed under `public/images/`. Run `npm run generate-samples` only if you need to regenerate them.
+
+[Open in StackBlitz](https://stackblitz.com/github/codemonkeynorth/react-pixi-cleanup-issue)
 
 ## Issue 1 — Memory retention
 
