@@ -35,10 +35,9 @@ const Code = ({ children }: { children: ReactNode }) => (
   <code style={codeStyle}>{children}</code>
 )
 
-const CLEANUP_CALLOUTS: Record<
-  TextureCleanupMode,
-  { tone: CalloutTone; title: string; body: ReactNode }
-> = {
+type Callout = { tone: CalloutTone; title: string; body: ReactNode }
+
+const CLEANUP_CALLOUTS: Record<TextureCleanupMode, Callout> = {
   none: {
     tone: "issue",
     title: "Issue 1 — memory retention",
@@ -118,8 +117,6 @@ export default function App() {
     createdTexturesRef.current = dropFromTracked(createdTexturesRef.current, previous)
 
     if (mode === "immediate") {
-      // Intentionally destroys while @pixi/react sprite may still reference `previous`.
-      // Pixi should not throw (applyStyleParams → addressModeU on null) — today it does.
       releaseTexture(previous)
       return
     }
@@ -202,13 +199,16 @@ export default function App() {
     setNavCount((c) => c + 1)
   }
 
+  const cleanupCallout = CLEANUP_CALLOUTS[cleanupMode]
+  const calloutStyle = cleanupCallout.tone === "ok" ? styles.calloutOk : styles.calloutIssue
+
   return (
     <div style={styles.page}>
       <header style={styles.header}>
         <h1 style={styles.title}>Pixi texture lifecycle repro</h1>
         <p style={styles.subtitle}>
           image-js decode → BufferImageSource → Texture → @pixi/react sprite. Two issues: retained
-          memory on navigation, and crash when destroying a texture the sprite still references.
+          memory on texture swap, and crash when destroying a texture the sprite still references.
         </p>
       </header>
 
@@ -234,16 +234,10 @@ export default function App() {
         ))}
       </fieldset>
 
-      {(() => {
-        const callout = CLEANUP_CALLOUTS[cleanupMode]
-        const calloutStyle = callout.tone === "ok" ? styles.calloutOk : styles.calloutIssue
-        return (
-          <div style={calloutStyle}>
-            <strong>{callout.title}</strong>
-            <p style={styles.calloutBody}>{callout.body}</p>
-          </div>
-        )
-      })()}
+      <div style={calloutStyle}>
+        <strong>{cleanupCallout.title}</strong>
+        <p style={styles.calloutBody}>{cleanupCallout.body}</p>
+      </div>
 
       <div style={styles.stats}>
         <span>Image: {currentUrl}</span>
@@ -264,7 +258,6 @@ export default function App() {
           <pixiSprite texture={texture ?? Texture.EMPTY} x={0} y={0} />
         </Application>
       </div>
-
     </div>
   )
 }
